@@ -6,6 +6,7 @@ Dependencies:
 
 Usage:
 - python3 protein_babelfish.py alignment.fasta
+- python3 protein_babelfish.py -i alignment.fasta
 """
 
 from __future__ import annotations
@@ -242,6 +243,10 @@ def clean_query_text(text: str) -> str:
     return normalize_text(text).strip(STRIP_QUERY_CHARS)
 
 
+def normalize_path_argument(path: Optional[Path]) -> Optional[Path]:
+    return path.expanduser() if path else None
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -251,8 +256,21 @@ def parse_arguments() -> argparse.Namespace:
         add_help=False,
     )
     parser.add_argument("-h", "--help", "--h", action="help", help="show this help message and exit")
+    parser.add_argument(
+        "-i",
+        "--i",
+        "--input",
+        dest="alignment_from_flag",
+        type=Path,
+        help="Path to the aligned FASTA file",
+    )
     parser.add_argument("alignment_fasta", nargs="?", type=Path, help="Path to the aligned FASTA file")
     args = parser.parse_args()
+    positional_path = normalize_path_argument(args.alignment_fasta)
+    flag_path = normalize_path_argument(args.alignment_from_flag)
+    if positional_path and flag_path and positional_path != flag_path:
+        parser.error("Please provide the alignment file either positionally or with -i/--i, not both.")
+    args.alignment_fasta = flag_path or positional_path
     if args.alignment_fasta is None:
         parser.print_help()
         raise SystemExit(0)
@@ -572,7 +590,10 @@ def print_sequence_choices(records: list[AlignmentRecord]) -> None:
 
     print("\nAvailable sequences:")
     print(render_plain_table(rows))
-    print("Enter the list number, accession, entry name, gene, or a unique text fragment from the list above.")
+    print(
+        "Enter the list number, accession, entry name, gene, "
+        "or a unique sequence motif from one of the entries above."
+    )
 
 
 def resolve_sequence_choice(response: str, records: list[AlignmentRecord]) -> AlignmentRecord:
