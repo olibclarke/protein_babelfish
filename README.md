@@ -21,4 +21,4 @@ python3 protein_babelfish.py /path/to/alignment.fasta
 - If headers are not UniProt-style, the script will ask for species and gene name for each sequence before starting the lookup.
 
 ## Caveat
-Written with the assistence of Codex/ChatGPT5.4; Tested against a few different structures, but there may still be bugs; let me know if you encounter any! I have provided a sample alignment for testing as part of the repo.
+Written with the assistence of Codex/ChatGPT5.4; Tested against a few different structures, but there may still be bugs; let me know if you encounter any! I have provided a [sample alignment](ryr_alignment.fasta) for testing as part of the repo.
