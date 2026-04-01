@@ -34,8 +34,8 @@ UNIPROT_HEADER_RE = re.compile(r"^(?P<db>[^|]+)\|(?P<accession>[^|]+)\|(?P<entry
 HEADER_FIELD_RE = re.compile(
     rf"\b(?P<tag>{HEADER_FIELD_PATTERN})=(?P<value>.*?)(?=\s(?:{HEADER_FIELD_PATTERN})=|$)"
 )
-SEQUENCE_CHARS_RE = re.compile(r"^[A-Z*.-]+$")
-NUMERIC_QUERY_RE = re.compile(r"(?:([A-Za-z]{1,20})(?:\s*-\s*|\s*)|)(\d+)")
+SEQUENCE_CHARS_RE = re.compile(r"^[A-Z*?.-]+$")
+NUMERIC_QUERY_RE = re.compile(r"(?:([A-Za-z*?]{1,20})(?:\s*-\s*|\s*)|)(\d+)")
 STRIP_QUERY_CHARS = " \t\r\n\"'`“”‘’,.;:"
 INPUT_TRANSLATION = str.maketrans(
     {
@@ -99,6 +99,8 @@ AMINO_ACID_CODES = {
     "C": "C",
     "CYS": "C",
     "CYSTEINE": "C",
+    "MSE": "M",
+    "SELENOMETHIONINE": "M",
     "U": "U",
     "SEC": "U",
     "SELENOCYSTEINE": "U",
@@ -156,13 +158,20 @@ AMINO_ACID_CODES = {
     "GLX": "Z",
     "X": "X",
     "XAA": "X",
+    "?": "?",
+    "UNK": "?",
+    "UNKNOWN": "?",
+    "*": "*",
+    "TER": "*",
+    "TERM": "*",
+    "STOP": "*",
     "V": "V",
     "VAL": "V",
     "VALINE": "V",
 }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HeaderInfo:
     database: str
     accession: str
@@ -187,7 +196,7 @@ class HeaderInfo:
         return self.gene or "-"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AlignmentRecord:
     header: HeaderInfo
     raw_header: str
@@ -195,22 +204,10 @@ class AlignmentRecord:
     ungapped_sequence: str
     residue_to_alignment: tuple[int, ...]
     alignment_to_residue: tuple[Optional[int], ...]
-
-    @property
-    def search_text(self) -> str:
-        return " ".join(
-            [
-                self.header.accession,
-                self.header.entry_name,
-                self.header.gene or "",
-                self.header.species or "",
-                self.header.protein_name,
-                self.raw_header,
-            ]
-        ).casefold()
+    search_text: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ResidueQuery:
     position: int
     residue: str
@@ -220,9 +217,37 @@ class ResidueQuery:
     def residue_label(self) -> str:
         return f"{self.residue}{self.position}"
 
+    @property
+    def filename_label(self) -> str:
+        residue = {"*": "STOP", "?": "UNK"}.get(self.residue, self.residue)
+        return f"{residue}{self.position}"
+
+
+@dataclass(frozen=True, slots=True)
+class MotifCandidate:
+    position: int
+    residue: str
+    context: str
+
+    @property
+    def residue_label(self) -> str:
+        return f"{self.residue}{self.position}"
+
 
 class QueryError(Exception):
     pass
+
+
+class AmbiguousMotifError(QueryError):
+    def __init__(self, motif_label: str, candidates: list[MotifCandidate]):
+        self.motif_label = motif_label
+        self.candidates = candidates
+        positions = ", ".join(str(candidate.position) for candidate in candidates[:10])
+        more = "..." if len(candidates) > 10 else ""
+        super().__init__(
+            f"The motif {motif_label} matched multiple positions ({positions}{more}). "
+            "Please provide a longer unique motif, or choose one of the matches below."
+        )
 
 
 def normalize_text(text: str, *, collapse_whitespace: bool = True) -> str:
@@ -245,6 +270,35 @@ def clean_query_text(text: str) -> str:
 
 def normalize_path_argument(path: Optional[Path]) -> Optional[Path]:
     return path.expanduser() if path else None
+
+
+def normalize_sequence_fragment(text: str) -> str:
+    return re.sub(r"[^A-Za-z*?.-]", "", normalize_text(text)).upper()
+
+
+def build_residue_query(record: AlignmentRecord, position: int, query_text: str) -> ResidueQuery:
+    return ResidueQuery(
+        position=position,
+        residue=record.ungapped_sequence[position - 1],
+        query_text=query_text.strip(),
+    )
+
+
+def build_search_text(header: HeaderInfo, raw_header: str) -> str:
+    return " ".join(
+        [
+            header.accession,
+            header.entry_name,
+            header.gene or "",
+            header.species or "",
+            header.protein_name,
+            raw_header,
+        ]
+    ).casefold()
+
+
+def replace_record_header(record: AlignmentRecord, header: HeaderInfo) -> AlignmentRecord:
+    return replace(record, header=header, search_text=build_search_text(header, record.raw_header))
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -270,10 +324,11 @@ def parse_arguments() -> argparse.Namespace:
     flag_path = normalize_path_argument(args.alignment_from_flag)
     if positional_path and flag_path and positional_path != flag_path:
         parser.error("Please provide the alignment file either positionally or with -i/--i, not both.")
-    args.alignment_fasta = flag_path or positional_path
-    if args.alignment_fasta is None:
+    alignment_path = flag_path or positional_path
+    if alignment_path is None:
         parser.print_help()
         raise SystemExit(0)
+    args.alignment_fasta = alignment_path
     return args
 
 
@@ -293,6 +348,8 @@ def parse_fasta(path: Path) -> list[tuple[str, str]]:
         line = normalize_text(line, collapse_whitespace=False)
         if not line:
             continue
+        if line.startswith(";"):
+            continue
         if line.startswith(">"):
             if current_header is not None:
                 records.append((current_header, "".join(current_sequence)))
@@ -306,7 +363,7 @@ def parse_fasta(path: Path) -> list[tuple[str, str]]:
         if not SEQUENCE_CHARS_RE.fullmatch(chunk):
             raise QueryError(
                 "Unexpected character(s) in sequence data on "
-                f"line {line_number}. Allowed characters are letters, '*', '.', and '-'."
+                f"line {line_number}. Allowed characters are letters, '?', '*', '.', and '-'."
             )
         current_sequence.append(chunk)
 
@@ -362,6 +419,7 @@ def parse_uniprot_header(header: str) -> HeaderInfo:
 
 
 def build_alignment_record(raw_header: str, sequence: str) -> AlignmentRecord:
+    header = parse_uniprot_header(raw_header)
     residue_to_alignment: list[int] = []
     alignment_to_residue: list[Optional[int]] = []
     ungapped_sequence: list[str] = []
@@ -377,12 +435,13 @@ def build_alignment_record(raw_header: str, sequence: str) -> AlignmentRecord:
         ungapped_sequence.append(character)
 
     return AlignmentRecord(
-        header=parse_uniprot_header(raw_header),
+        header=header,
         raw_header=raw_header,
         aligned_sequence=sequence,
         ungapped_sequence="".join(ungapped_sequence),
         residue_to_alignment=tuple(residue_to_alignment),
         alignment_to_residue=tuple(alignment_to_residue),
+        search_text=build_search_text(header, raw_header),
     )
 
 
@@ -417,18 +476,16 @@ def complete_sequence_metadata(records: list[AlignmentRecord]) -> list[Alignment
         print(f"Header: {record.raw_header}")
         species = prompt_metadata_value("Species", record.header.species)
         gene = prompt_metadata_value("Gene name", record.header.gene)
-        updated_records.append(
-            replace(
-                record,
-                header=replace(record.header, species=species, gene=gene),
-            )
-        )
+        updated_records.append(replace_record_header(record, replace(record.header, species=species, gene=gene)))
 
     return updated_records
 
 
 def normalize_residue_token(token: str) -> Optional[str]:
-    cleaned = re.sub(r"[^A-Za-z]", "", normalize_text(token)).upper()
+    normalized = normalize_text(token)
+    if normalized in {"*", "?"}:
+        return normalized
+    cleaned = re.sub(r"[^A-Za-z]", "", normalized).upper()
     if not cleaned:
         return None
     return AMINO_ACID_CODES.get(cleaned)
@@ -457,7 +514,8 @@ def format_context(sequence: str, index: int, *, one_based: bool = False, window
     left = sequence[max(0, zero_based - window) : zero_based]
     center = sequence[zero_based]
     right = sequence[zero_based + 1 : zero_based + 1 + window]
-    return f"{left}*{center}*{right}"
+    marker = f"[{center}]" if center == "*" else f"*{center}*"
+    return f"{left}{marker}{right}"
 
 
 def clip_text(text: str, width: int) -> str:
@@ -508,11 +566,7 @@ def resolve_numeric_query(raw_query: str, record: AlignmentRecord) -> ResidueQue
                 f"There is no {expected_residue} at position {position} in the selected sequence: {context}"
             )
 
-    return ResidueQuery(
-        position=position,
-        residue=actual_residue,
-        query_text=raw_query.strip(),
-    )
+    return build_residue_query(record, position, raw_query)
 
 
 def resolve_motif_query(raw_query: str, record: AlignmentRecord) -> ResidueQuery:
@@ -543,30 +597,47 @@ def resolve_motif_query(raw_query: str, record: AlignmentRecord) -> ResidueQuery
     if not matches:
         raise QueryError(f"The motif {left}*{focus_residue}*{right} was not found in the selected sequence.")
     if len(matches) > 1:
-        positions = ", ".join(str(match + len(left) + 1) for match in matches[:10])
-        more = "..." if len(matches) > 10 else ""
-        raise QueryError(
-            f"The motif {left}*{focus_residue}*{right} matched multiple positions ({positions}{more}). "
-            "Please provide a longer unique motif."
+        raise AmbiguousMotifError(
+            f"{left}*{focus_residue}*{right}",
+            [
+                MotifCandidate(
+                    position=match + len(left) + 1,
+                    residue=focus_residue,
+                    context=format_context(record.ungapped_sequence, match + len(left) + 1, one_based=True),
+                )
+                for match in matches
+            ],
         )
 
     position = matches[0] + len(left) + 1
-    return ResidueQuery(
-        position=position,
-        residue=focus_residue,
-        query_text=raw_query.strip(),
-    )
+    return build_residue_query(record, position, raw_query)
 
 
 def resolve_residue_query(raw_query: str, record: AlignmentRecord) -> ResidueQuery:
+    if NUMERIC_QUERY_RE.fullmatch(raw_query):
+        return resolve_numeric_query(raw_query, record)
     if "*" in raw_query:
         return resolve_motif_query(raw_query, record)
+    if len(normalize_sequence_fragment(raw_query)) >= 3 and not any(character.isdigit() for character in raw_query):
+        raise QueryError(
+            "If you are entering a motif, mark the residue of interest with asterisks, "
+            "for example EGEKV*R*VGDDL."
+        )
     return resolve_numeric_query(raw_query, record)
 
 
 def print_sequence_choices(records: list[AlignmentRecord]) -> None:
+    print("\nAvailable sequences:")
+    print(render_plain_table(build_sequence_choice_rows(records)))
+    print(
+        "Enter the list number, accession, entry name, gene, "
+        "or a unique sequence motif from one of the entries above."
+    )
+
+
+def build_sequence_choice_rows(records: list[AlignmentRecord]) -> list[dict[str, str]]:
     terminal_width = shutil.get_terminal_size(fallback=(120, 20)).columns
-    rows = [
+    rows: list[dict[str, str]] = [
         {
             "No.": str(index),
             "Entry": record.header.entry_name or record.header.accession_label,
@@ -587,13 +658,7 @@ def print_sequence_choices(records: list[AlignmentRecord]) -> None:
     protein_width = max(12, terminal_width - fixed_width - separator_width)
     for row in rows:
         row["Protein"] = clip_text(row["Protein"], protein_width)
-
-    print("\nAvailable sequences:")
-    print(render_plain_table(rows))
-    print(
-        "Enter the list number, accession, entry name, gene, "
-        "or a unique sequence motif from one of the entries above."
-    )
+    return rows
 
 
 def resolve_sequence_choice(response: str, records: list[AlignmentRecord]) -> AlignmentRecord:
@@ -609,6 +674,14 @@ def resolve_sequence_choice(response: str, records: list[AlignmentRecord]) -> Al
 
     lowered_choice = choice.casefold()
     matches = [record for record in records if lowered_choice in record.search_text]
+    if not matches:
+        motif = normalize_sequence_fragment(choice)
+        if len(motif) >= 3:
+            matches = [
+                record
+                for record in records
+                if motif in record.ungapped_sequence or motif in record.aligned_sequence
+            ]
 
     if not matches:
         raise QueryError(f"No sequence matched '{choice}'.")
@@ -628,14 +701,56 @@ def prompt_for_sequence(records: list[AlignmentRecord]) -> AlignmentRecord:
             print(f"\n{exc}")
 
 
-def prompt_after_query_error() -> str:
+def prompt_after_query_error() -> tuple[str, Optional[str]]:
     while True:
-        response = prompt(
-            "Press Enter to try again, type 's' to choose another sequence, or 'q' to quit: "
-        ).lower()
-        if response in {"", "s", "q"}:
-            return response
-        print("Please press Enter, or type 's' or 'q'.")
+        response = clean_query_text(
+            prompt(
+                "Press Enter to try again, type 's' to choose another sequence, "
+                "'q' to quit, or enter a new residue/motif: "
+            )
+        )
+        lowered = response.lower()
+        if not response:
+            return "retry", None
+        if lowered == "s":
+            return "sequence", None
+        if lowered == "q":
+            return "quit", None
+        return "query", response
+
+
+def prompt_for_ambiguous_motif_selection(error: AmbiguousMotifError) -> tuple[str, Optional[object]]:
+    rows = [
+        {
+            "No.": str(index),
+            "Residue": candidate.residue_label,
+            "Context": candidate.context,
+        }
+        for index, candidate in enumerate(error.candidates, start=1)
+    ]
+    print(render_plain_table(rows))
+
+    while True:
+        response = clean_query_text(
+            prompt(
+                "Enter a match number, a longer motif, 's' to choose another sequence, "
+                "or 'q' to quit: "
+            )
+        )
+        lowered = response.lower()
+        if not response:
+            return "retry", None
+        if lowered == "s":
+            return "sequence", None
+        if lowered == "q":
+            return "quit", None
+        if response.isdigit():
+            index = int(response)
+            if 1 <= index <= len(error.candidates):
+                return "candidate", error.candidates[index - 1]
+            print(f"Please enter a match number between 1 and {len(error.candidates)}.")
+            continue
+        return "query", response
 
 
 def prompt_for_query(record: AlignmentRecord) -> Optional[ResidueQuery]:
@@ -644,21 +759,35 @@ def prompt_for_query(record: AlignmentRecord) -> Optional[ResidueQuery]:
         f"{record.header.species_label} | {record.header.protein_name}"
     )
 
+    raw_query: Optional[str] = None
     while True:
-        raw_query = clean_query_text(prompt("Which residue would you like to convert numbering for? "))
+        if raw_query is None:
+            raw_query = clean_query_text(prompt("Which residue would you like to convert numbering for? "))
         if not raw_query:
             print("Please enter a residue number or a marked motif, for example 235 or RFTH*R*ADTV.")
+            raw_query = None
             continue
 
         try:
             return resolve_residue_query(raw_query, record)
+        except AmbiguousMotifError as exc:
+            print(f"\n{exc}")
+            action, value = prompt_for_ambiguous_motif_selection(exc)
+            if action == "sequence":
+                return None
+            if action == "quit":
+                raise SystemExit(0)
+            if action == "candidate":
+                return build_residue_query(record, value.position, raw_query)
+            raw_query = value
         except QueryError as exc:
             print(f"\n{exc}")
-            follow_up = prompt_after_query_error()
-            if follow_up == "s":
+            action, next_query = prompt_after_query_error()
+            if action == "sequence":
                 return None
-            if follow_up == "q":
+            if action == "quit":
                 raise SystemExit(0)
+            raw_query = next_query
 
 
 def build_results(records: list[AlignmentRecord], source_record: AlignmentRecord, query: ResidueQuery) -> list[dict[str, str]]:
@@ -722,7 +851,7 @@ def write_markdown_report(
     query: ResidueQuery,
 ) -> Path:
     filename = sanitize_filename(
-        f"residue_mapping_{source_record.header.entry_name}_{query.residue_label}"
+        f"residue_mapping_{source_record.header.entry_name}_{query.filename_label}"
     )
     output_path = unique_output_path(Path.cwd() / f"{filename}.md")
 
@@ -744,7 +873,10 @@ def write_markdown_report(
     for row in rows:
         lines.append("| " + " | ".join(escape_markdown(value) for value in row.values()) + " |")
 
-    output_path.write_text("\n".join(lines) + "\n")
+    try:
+        output_path.write_text("\n".join(lines) + "\n")
+    except OSError as exc:
+        raise QueryError(f"Could not write markdown report to {output_path}") from exc
     return output_path
 
 
